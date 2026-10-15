@@ -1,0 +1,1194 @@
+########################################
+#  나비엔 온수매트 (EQM560, BLE) 브릿지 — 2대
+#  + 아이방 BLE 프록시 겸용
+#  Seeed XIAO ESP32-C6 (외장 안테나)
+#
+#  프레임 20B : [0]=0xB2, [19]=(Σ[1..18])&0xFF
+#    B2 01 ... 등록/인증   → 응답 F1 01(ID발급) / F1 02(인증완료) / F1 00(거절)
+#    B2 00 ... 상태 push (1초 주기)
+#    B2 80 ... 제어
+#  운전모드 : 1난방 2예약 3수면 4살균 5오류 6전원꺼짐 7빠른난방 8이온케어 9사용자수면
+#
+#  ※ 엔티티 name 은 영문 유지 — ESPHome unique_id 가 name 에서 만들어져서
+#    바꾸면 HA 에 새 엔티티가 생기고 기존 이력·이름이 끊긴다. 한글 이름은 HA 에서 지정.
+########################################
+
+substitutions:
+  mat1_mac: "2C:E2:A8:XX:XX:XX"   # 매트1 BLE MAC (스캔 시 "kdo hotwatermat")
+  mat2_mac: "2C:E2:A8:YY:YY:YY"   # 매트2 BLE MAC
+
+esphome:
+  name: navien-mat-bridge
+  friendly_name: 온수매트 브릿지
+  on_boot:
+    priority: 800
+    then:
+      - wifi.disable:
+      - output.turn_off: rf_switch_power   # GPIO3 LOW = RF 스위치 활성
+      - delay: 100ms
+      - output.turn_on: rf_ant_select      # GPIO14 HIGH = 외장 안테나
+      - wifi.enable:
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
+# /config/esphome/components/navien_mat/ 에 파일 3개
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [navien_mat]
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret navien_mat_api_key
+
+ota:
+  - platform: esphome
+    password: !secret navien_mat_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+output:
+  - platform: gpio
+    id: rf_switch_power
+    pin: GPIO3
+  - platform: gpio
+    id: rf_ant_select
+    pin: GPIO14
+
+########################################
+#  BLE 공통 / 프록시
+#  연결 슬롯 4 = 매트 2 + 프록시 2
+########################################
+
+esp32_ble:
+  max_connections: 4
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 320ms
+    window: 300ms
+    active: true
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 2
+
+########################################
+#  상태 변수
+########################################
+
+globals:
+  # ── 매트1 ──
+  - id: dev_id                # 매트 deviceID 6B (앱: bArr[3]~bArr[8])
+    type: uint8_t[6]
+    restore_value: yes
+    initial_value: '{0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE}'
+  - id: have_id
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: need_auth
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: session_ok
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: rx_buf
+    type: std::vector<uint8_t>
+    restore_value: no
+  - id: last_status            # 마지막 B2 00 상태프레임 (제어 프레임의 기반)
+    type: std::vector<uint8_t>
+    restore_value: no
+  - id: last_rx_ms             # 마지막 정상 프레임 수신 시각 (통신 생존 판정)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: tx_mode                # 1 = 난방(ON), 6 = 전원 OFF
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: once_mode              # 1회용 명령 모드 (7=빠른난방 토글, 8=이온케어), 0=없음
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: fast_req               # 빠른난방 켜기(true)/끄기(false) 요청
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: tx_temp                # 마지막으로 확인된 설정온도
+    type: int
+    restore_value: yes
+    initial_value: '33'
+  - id: tx_lock
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: tx_vol
+    type: int
+    restore_value: no
+    initial_value: '2'
+  - id: st_hour                # 이온케어 살균 설정시간 (b[16] 상위니블)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: err_code               # 오류 코드 (0 = 정상)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: fast_on                # 빠른난방 동작중 여부
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ── 매트2 ──
+  - id: dev_id2                # 매트 deviceID 6B (앱: bArr[3]~bArr[8])
+    type: uint8_t[6]
+    restore_value: yes
+    initial_value: '{0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE}'
+  - id: have_id2
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: need_auth2
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: session_ok2
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: rx_buf2
+    type: std::vector<uint8_t>
+    restore_value: no
+  - id: last_status2            # 마지막 B2 00 상태프레임 (제어 프레임의 기반)
+    type: std::vector<uint8_t>
+    restore_value: no
+  - id: last_rx_ms2             # 마지막 정상 프레임 수신 시각 (통신 생존 판정)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: tx_mode2                # 1 = 난방(ON), 6 = 전원 OFF
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: once_mode2              # 1회용 명령 모드 (7=빠른난방 토글, 8=이온케어), 0=없음
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: fast_req2               # 빠른난방 켜기(true)/끄기(false) 요청
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: tx_temp2                # 마지막으로 확인된 설정온도
+    type: int
+    restore_value: yes
+    initial_value: '33'
+  - id: tx_lock2
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: tx_vol2
+    type: int
+    restore_value: no
+    initial_value: '2'
+  - id: st_hour2                # 이온케어 살균 설정시간 (b[16] 상위니블)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: err_code2               # 오류 코드 (0 = 정상)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: fast_on2                # 빠른난방 동작중 여부
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+########################################
+#  매트 BLE 클라이언트
+########################################
+
+ble_client:
+  # ── 매트1 ──
+  - mac_address: ${mat1_mac}
+    id: mat_ble
+    on_connect:
+      - logger.log: { format: ">>> 매트1 연결됨", level: INFO }
+      - text_sensor.template.publish:
+          id: mat_auth
+          state: "연결됨 (인증 대기)"
+      - script.stop: send_register
+      - delay: 400ms
+      - script.execute: send_register
+      - delay: 1500ms
+      - if:
+          condition:
+            lambda: 'return !id(session_ok) && id(mat_ble)->connected();'
+          then:
+            - script.execute: send_register
+    on_disconnect:
+      - logger.log: { format: ">>> 매트1 끊김", level: INFO }
+      - script.stop: send_register
+      - script.stop: send_cmd
+      - lambda: |-
+          id(need_auth) = false;
+          id(session_ok) = false;
+          id(last_status).clear();
+          id(last_rx_ms) = 0;
+          id(mat_auth).publish_state("끊김");
+
+  # ── 매트2 ──
+  - mac_address: ${mat2_mac}
+    id: mat_ble2
+    on_connect:
+      - logger.log: { format: ">>> 매트2 연결됨", level: INFO }
+      - text_sensor.template.publish:
+          id: mat_auth2
+          state: "연결됨 (인증 대기)"
+      - script.stop: send_register2
+      - delay: 400ms
+      - script.execute: send_register2
+      - delay: 1500ms
+      - if:
+          condition:
+            lambda: 'return !id(session_ok2) && id(mat_ble2)->connected();'
+          then:
+            - script.execute: send_register2
+    on_disconnect:
+      - logger.log: { format: ">>> 매트2 끊김", level: INFO }
+      - script.stop: send_register2
+      - script.stop: send_cmd2
+      - lambda: |-
+          id(need_auth2) = false;
+          id(session_ok2) = false;
+          id(last_status2).clear();
+          id(last_rx_ms2) = 0;
+          id(mat_auth2).publish_state("끊김");
+
+########################################
+#  프로토콜 스크립트
+########################################
+
+script:
+  ########## 매트1 ##########
+
+  # ── 등록 / 인증 ──
+  - id: send_register
+    then:
+      - if:
+          condition:
+            lambda: 'return id(mat_ble)->connected();'
+          then:
+            - ble_client.ble_write:
+                id: mat_ble
+                service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+                characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80200dd'
+                value: !lambda |-
+                  std::vector<uint8_t> f(20, 0xFE);
+                  f[0] = 0xB2;
+                  f[1] = 0x01;
+                  if (id(have_id)) {
+                    for (int i = 0; i < 6; i++) f[2 + i] = id(dev_id)[i];
+                  }
+                  uint32_t s = 0;
+                  for (int i = 1; i <= 18; i++) s += f[i];
+                  f[19] = (uint8_t)(s & 0xFF);
+                  std::string h; char t[4];
+                  for (uint8_t c : f) { sprintf(t, "%02X ", c); h += t; }
+                  ESP_LOGI("navien", "TX %s (have_id=%d)", h.c_str(), id(have_id) ? 1 : 0);
+                  return f;
+
+  # ── 거절 후 30초 쉬었다가 재연결 (재연결 폭주 방지) ──
+  - id: reconnect_later
+    mode: restart
+    then:
+      - delay: 30s
+      - lambda: |-
+          if (id(ble_enable).state) id(mat_ble)->set_enabled(true);
+
+  # ── 제어 ──
+  #   마지막 상태프레임을 복사하고 mode / 온도 / 잠금 / 음량만 교체
+  #   싱글매트(g1=1) : 현재=[6], 설정=[9]   |   더블매트 : [7][8], [10][11]
+  #   상태프레임이 없으면 전송 자체를 생략 (0xFE 쓰레기 프레임 방지)
+  - id: send_cmd
+    mode: restart                 # 새 명령이 오면 이전 전송 대기를 버리고 즉시 최신 값 전송
+    then:
+      - if:
+          condition:
+            lambda: 'return id(last_status).size() == 20;'
+          then:
+            - ble_client.ble_write:
+                id: mat_ble
+                service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+                characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80200dd'
+                value: !lambda |-
+                  std::vector<uint8_t> f(20, 0xFE);
+                  std::vector<uint8_t> &s = id(last_status);
+
+                  int mode = id(once_mode) ? id(once_mode) : id(tx_mode);                 // 1난방 3수면 6꺼짐 7빠른난방 8이온케어
+                  int g1 = s[3] & 0x01;                      // 1 = 싱글매트
+                  int j1 = s[6];                             // 급수 / 현재
+                  int l  = (g1 == 1) ? s[6] : s[7];
+                  int n  = s[8];
+                  int k1 = s[9];
+                  int k  = (g1 == 1) ? s[9] : s[10];         // 설정온도
+                  int m  = s[11];
+                  int ht = (s[5] >= 2 && s[5] <= 4) ? s[5] : 2;   // 켠 직후 s[5]=0 이면 온도 변경 무시됨 → 정상 상태값 2 로 보정
+                  if (mode != 6) k = id(tx_temp);
+
+                  int vol = id(tx_vol); if (vol < 0) vol = 0; if (vol > 3) vol = 3;
+
+                  f[0] = 0xB2;
+                  f[1] = 0x80;
+                  f[2] = (uint8_t) mode;
+                  f[3] = (mode != 6 ? 0x02 : 0x00) | (id(tx_lock) ? 0x04 : 0x00);
+                  f[4] = (uint8_t)(vol << 4);
+
+                  if (mode == 6) {                           // 전원 OFF
+                    f[6] = j1; f[7] = l; f[8] = n;
+                    f[10] = 0; f[11] = 0; f[12] = 0; f[13] = 0; f[14] = 0;
+                  } else if (mode == 3) {                    // 수면 — 30~33°C, 5~12시간
+                    int sl = k;  if (sl < 30) sl = 30; if (sl > 33) sl = 33;
+                    if (sl != id(tx_temp)) {                 // 범위 밖 요청 → HA 표시를 실제 값으로
+                      id(tx_temp) = sl;
+                      id(mat_climate).publish_from_device(true, (float)((g1 == 1) ? s[6] : s[7]), (float) sl);
+                    }
+                    int hr = 8;
+                    if (!std::isnan(id(mat_sleep_h).state)) hr = (int) lroundf(id(mat_sleep_h).state);
+                    if (hr < 5) hr = 5; if (hr > 12) hr = 12;
+                    f[5] = ht;
+                    f[6] = j1; f[7] = l; f[8] = n;
+                    if (g1 == 0) { f[9]=k1; f[10]=sl; f[11]=sl; f[12]=0; f[13]=hr; f[14]=hr; }
+                    else         { f[9]=sl; f[10]=0;  f[11]=0;  f[12]=hr; f[13]=0; f[14]=0; }
+                    f[15] = 1; f[16] = 1;
+                  } else {                                   // 1 난방 / 7 빠른난방 / 8 이온케어
+                    f[5] = ht;
+                    if (g1 == 0) { f[6]=j1; f[7]=l; f[8]=n; f[9]=k1; f[10]=k; f[11]=m; }
+                    else         { f[9]=k; }
+                    // 빠른난방·이온케어는 운전모드가 아니라 부가기능 → 1회용 명령으로만 전송
+                    if (mode == 7) f[12] = id(fast_req) ? 1 : 0;
+                    if (mode == 8) {
+                      f[12] = 1;
+                      if (id(st_hour) > 0) f[16] = (uint8_t)(id(st_hour) << 4);
+                    }
+                  }
+
+                  uint32_t c = 0;
+                  for (int i = 1; i <= 18; i++) c += f[i];
+                  f[19] = (uint8_t)(c & 0xFF);
+                  std::string h; char t[4];
+                  for (uint8_t x2 : f) { sprintf(t, "%02X ", x2); h += t; }
+                  ESP_LOGI("navien", "TX(cmd mode=%d temp=%d lock=%d vol=%d) %s",
+                           mode, id(tx_temp), id(tx_lock) ? 1 : 0, vol, h.c_str());
+                  id(once_mode) = 0;
+                  return f;
+          else:
+            - lambda: 'id(once_mode) = 0;'
+            - logger.log: { format: "매트1: 상태프레임 없음 - 제어 생략", level: WARN }
+
+  # ── 수신 파싱 ──
+  - id: parse_rx
+    then:
+      - lambda: |-
+          std::vector<uint8_t> &b = id(rx_buf);
+          if (b.size() != 20) return;
+
+          uint32_t s = 0;
+          for (int i = 1; i <= 18; i++) s += b[i];
+          if ((uint8_t)(s & 0xFF) != b[19] || b[0] != 0xB2) {
+            ESP_LOGW("navien", "프레임 오류 (CRC/매직)");
+            return;
+          }
+          id(last_rx_ms) = millis();
+
+          // ── 핸드셰이크 응답 ──
+          if (b[1] == 0xF1) {
+            id(session_ok) = true;
+            if (b[2] == 0x01) {
+              for (int i = 0; i < 6; i++) id(dev_id)[i] = b[3 + i];
+              id(have_id) = true;
+              id(need_auth) = true;
+              ESP_LOGI("navien", "★ 등록 성공 deviceID = %02X%02X%02X%02X%02X%02X",
+                       b[3], b[4], b[5], b[6], b[7], b[8]);
+              id(mat_auth).publish_state("등록됨 (인증 중)");
+            } else if (b[2] == 0x02) {
+              ESP_LOGI("navien", "★ 인증 완료 (세션 확립)");
+              id(mat_auth).publish_state("정상");
+            } else {
+              ESP_LOGW("navien", "등록 거절 (state=%d) — 매트 등록 모드 필요", b[2]);
+              id(session_ok) = false;
+              id(mat_auth).publish_state("거절됨 (등록 모드 필요)");
+              id(mat_ble)->set_enabled(false);
+              id(reconnect_later).execute();
+            }
+            return;
+          }
+
+          // ── 상태 프레임 ──
+          if (b[1] != 0x00) return;
+          if (b == id(last_status)) return;         // 중복 무시 (앱과 동일)
+          id(last_status) = b;
+          id(session_ok) = true;
+
+          int  g1   = b[3] & 0x01;
+          bool pw   = (b[3] & 0x02) != 0;
+          bool lk   = (b[3] & 0x04) != 0;
+          int  vol  = (b[4] >> 4) & 0x0F; if (vol > 3) vol = 3;
+          int  cur  = (g1 == 1) ? b[6] : b[7];
+          int  code = b[2];
+
+          // 설정온도는 난방 계열 모드에서만 프레임에 실린다 (OFF·오류·살균은 0xFE → 마지막 값 유지)
+          bool temp_valid = (code == 1 || code == 2 || code == 3 ||
+                             code == 7 || code == 8 || code == 9);
+          if (temp_valid) {
+            int st = (g1 == 1) ? b[9] : b[10];
+            if (st >= 28 && st <= 45) id(tx_temp) = st;
+          }
+
+          ESP_LOGI("navien", "상태 mode=%d power=%d lock=%d %s 현재=%d°C 설정=%d°C 음량=%d b12=%d",
+                   code, pw ? 1 : 0, lk ? 1 : 0, g1 ? "싱글" : "더블", cur, id(tx_temp), vol, b[12]);
+          {
+            std::string rh; char rt[4];
+            for (uint8_t c : b) { sprintf(rt, "%02X ", c); rh += rt; }
+            ESP_LOGD("navien", "RX %s", rh.c_str());
+          }
+
+          // 송신용 기준값 동기화
+          id(tx_mode) = pw ? (code == 3 ? 3 : 1) : 6;           // 기본 운전모드는 난방/수면 둘뿐
+          id(tx_lock) = lk;
+          id(tx_vol)  = vol;
+          id(st_hour) = (b[16] >> 4) & 0x0F;
+          // 빠른난방: b[15] = 남은 시간(분), 0/FE = 꺼짐
+          bool fo = pw && b[15] != 0xFE && b[15] > 0;
+          id(fast_on) = fo;
+          if (fo)                          id(mat_mode_sel).publish_state("빠른난방");
+          else if (code == 1 || code == 3) id(mat_mode_sel).publish_state(code == 3 ? "수면" : "난방");
+          if (id(mat_auth).state != "정상") id(mat_auth).publish_state("정상");
+
+          id(mat_climate).publish_from_device(pw, (float) cur, (float) id(tx_temp));
+          id(mat_lock_sw).publish_state(lk);
+
+          const char *vol_opts[4] = {"음소거", "1단", "2단", "3단"};
+          id(mat_vol).publish_state(vol_opts[vol]);
+
+          const char *state_txt;
+          switch (code) {
+            case 1: state_txt = "난방";       break;
+            case 2: state_txt = "예약";       break;
+            case 3: state_txt = "수면";       break;
+            case 4: state_txt = "살균";       break;
+            case 5: state_txt = "오류";       break;
+            case 6: state_txt = "전원 꺼짐";  break;
+            case 7: state_txt = "빠른난방";   break;
+            case 8: state_txt = "이온케어";   break;
+            case 9: state_txt = "사용자 수면"; break;
+            default: state_txt = "알 수 없음"; break;
+          }
+          int err = (code == 5) ? (b[9] * 100 + b[10]) : 0;
+          id(err_code) = err;
+          std::string st_txt = state_txt;
+          if (err > 0) { char eb[16]; sprintf(eb, " E%d", err); st_txt += eb; }
+          if (fo)      { char fb[24]; sprintf(fb, " · 빠른난방 %d분", b[15]); st_txt += fb; }
+          if (id(mat_state).state != st_txt) id(mat_state).publish_state(st_txt);
+      - if:
+          condition:
+            lambda: 'return id(need_auth);'
+          then:
+            - lambda: 'id(need_auth) = false;'
+            - delay: 300ms
+            - logger.log: { format: ">>> 매트1: deviceID 로 인증 전송", level: INFO }
+            - script.execute: send_register
+
+  ########## 매트2 ##########
+
+  # ── 등록 / 인증 ──
+  - id: send_register2
+    then:
+      - if:
+          condition:
+            lambda: 'return id(mat_ble2)->connected();'
+          then:
+            - ble_client.ble_write:
+                id: mat_ble2
+                service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+                characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80200dd'
+                value: !lambda |-
+                  std::vector<uint8_t> f(20, 0xFE);
+                  f[0] = 0xB2;
+                  f[1] = 0x01;
+                  if (id(have_id2)) {
+                    for (int i = 0; i < 6; i++) f[2 + i] = id(dev_id2)[i];
+                  }
+                  uint32_t s = 0;
+                  for (int i = 1; i <= 18; i++) s += f[i];
+                  f[19] = (uint8_t)(s & 0xFF);
+                  std::string h; char t[4];
+                  for (uint8_t c : f) { sprintf(t, "%02X ", c); h += t; }
+                  ESP_LOGI("navien2", "TX %s (have_id=%d)", h.c_str(), id(have_id2) ? 1 : 0);
+                  return f;
+
+  # ── 거절 후 30초 쉬었다가 재연결 (재연결 폭주 방지) ──
+  - id: reconnect_later2
+    mode: restart
+    then:
+      - delay: 30s
+      - lambda: |-
+          if (id(ble_enable2).state) id(mat_ble2)->set_enabled(true);
+
+  # ── 제어 ──
+  #   마지막 상태프레임을 복사하고 mode / 온도 / 잠금 / 음량만 교체
+  #   싱글매트(g1=1) : 현재=[6], 설정=[9]   |   더블매트 : [7][8], [10][11]
+  #   상태프레임이 없으면 전송 자체를 생략 (0xFE 쓰레기 프레임 방지)
+  - id: send_cmd2
+    mode: restart                 # 새 명령이 오면 이전 전송 대기를 버리고 즉시 최신 값 전송
+    then:
+      - if:
+          condition:
+            lambda: 'return id(last_status2).size() == 20;'
+          then:
+            - ble_client.ble_write:
+                id: mat_ble2
+                service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+                characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80200dd'
+                value: !lambda |-
+                  std::vector<uint8_t> f(20, 0xFE);
+                  std::vector<uint8_t> &s = id(last_status2);
+
+                  int mode = id(once_mode2) ? id(once_mode2) : id(tx_mode2);                 // 1난방 3수면 6꺼짐 7빠른난방 8이온케어
+                  int g1 = s[3] & 0x01;                      // 1 = 싱글매트
+                  int j1 = s[6];                             // 급수 / 현재
+                  int l  = (g1 == 1) ? s[6] : s[7];
+                  int n  = s[8];
+                  int k1 = s[9];
+                  int k  = (g1 == 1) ? s[9] : s[10];         // 설정온도
+                  int m  = s[11];
+                  int ht = (s[5] >= 2 && s[5] <= 4) ? s[5] : 2;   // 켠 직후 s[5]=0 이면 온도 변경 무시됨 → 정상 상태값 2 로 보정
+                  if (mode != 6) k = id(tx_temp2);
+
+                  int vol = id(tx_vol2); if (vol < 0) vol = 0; if (vol > 3) vol = 3;
+
+                  f[0] = 0xB2;
+                  f[1] = 0x80;
+                  f[2] = (uint8_t) mode;
+                  f[3] = (mode != 6 ? 0x02 : 0x00) | (id(tx_lock2) ? 0x04 : 0x00);
+                  f[4] = (uint8_t)(vol << 4);
+
+                  if (mode == 6) {                           // 전원 OFF
+                    f[6] = j1; f[7] = l; f[8] = n;
+                    f[10] = 0; f[11] = 0; f[12] = 0; f[13] = 0; f[14] = 0;
+                  } else if (mode == 3) {                    // 수면 — 30~33°C, 5~12시간
+                    int sl = k;  if (sl < 30) sl = 30; if (sl > 33) sl = 33;
+                    if (sl != id(tx_temp2)) {                 // 범위 밖 요청 → HA 표시를 실제 값으로
+                      id(tx_temp2) = sl;
+                      id(mat_climate2).publish_from_device(true, (float)((g1 == 1) ? s[6] : s[7]), (float) sl);
+                    }
+                    int hr = 8;
+                    if (!std::isnan(id(mat_sleep_h2).state)) hr = (int) lroundf(id(mat_sleep_h2).state);
+                    if (hr < 5) hr = 5; if (hr > 12) hr = 12;
+                    f[5] = ht;
+                    f[6] = j1; f[7] = l; f[8] = n;
+                    if (g1 == 0) { f[9]=k1; f[10]=sl; f[11]=sl; f[12]=0; f[13]=hr; f[14]=hr; }
+                    else         { f[9]=sl; f[10]=0;  f[11]=0;  f[12]=hr; f[13]=0; f[14]=0; }
+                    f[15] = 1; f[16] = 1;
+                  } else {                                   // 1 난방 / 7 빠른난방 / 8 이온케어
+                    f[5] = ht;
+                    if (g1 == 0) { f[6]=j1; f[7]=l; f[8]=n; f[9]=k1; f[10]=k; f[11]=m; }
+                    else         { f[9]=k; }
+                    // 빠른난방·이온케어는 운전모드가 아니라 부가기능 → 1회용 명령으로만 전송
+                    if (mode == 7) f[12] = id(fast_req2) ? 1 : 0;
+                    if (mode == 8) {
+                      f[12] = 1;
+                      if (id(st_hour2) > 0) f[16] = (uint8_t)(id(st_hour2) << 4);
+                    }
+                  }
+
+                  uint32_t c = 0;
+                  for (int i = 1; i <= 18; i++) c += f[i];
+                  f[19] = (uint8_t)(c & 0xFF);
+                  std::string h; char t[4];
+                  for (uint8_t x2 : f) { sprintf(t, "%02X ", x2); h += t; }
+                  ESP_LOGI("navien2", "TX(cmd mode=%d temp=%d lock=%d vol=%d) %s",
+                           mode, id(tx_temp2), id(tx_lock2) ? 1 : 0, vol, h.c_str());
+                  id(once_mode2) = 0;
+                  return f;
+          else:
+            - lambda: 'id(once_mode2) = 0;'
+            - logger.log: { format: "매트2: 상태프레임 없음 - 제어 생략", level: WARN }
+
+  # ── 수신 파싱 ──
+  - id: parse_rx2
+    then:
+      - lambda: |-
+          std::vector<uint8_t> &b = id(rx_buf2);
+          if (b.size() != 20) return;
+
+          uint32_t s = 0;
+          for (int i = 1; i <= 18; i++) s += b[i];
+          if ((uint8_t)(s & 0xFF) != b[19] || b[0] != 0xB2) {
+            ESP_LOGW("navien2", "프레임 오류 (CRC/매직)");
+            return;
+          }
+          id(last_rx_ms2) = millis();
+
+          // ── 핸드셰이크 응답 ──
+          if (b[1] == 0xF1) {
+            id(session_ok2) = true;
+            if (b[2] == 0x01) {
+              for (int i = 0; i < 6; i++) id(dev_id2)[i] = b[3 + i];
+              id(have_id2) = true;
+              id(need_auth2) = true;
+              ESP_LOGI("navien2", "★ 등록 성공 deviceID = %02X%02X%02X%02X%02X%02X",
+                       b[3], b[4], b[5], b[6], b[7], b[8]);
+              id(mat_auth2).publish_state("등록됨 (인증 중)");
+            } else if (b[2] == 0x02) {
+              ESP_LOGI("navien2", "★ 인증 완료 (세션 확립)");
+              id(mat_auth2).publish_state("정상");
+            } else {
+              ESP_LOGW("navien2", "등록 거절 (state=%d) — 매트 등록 모드 필요", b[2]);
+              id(session_ok2) = false;
+              id(mat_auth2).publish_state("거절됨 (등록 모드 필요)");
+              id(mat_ble2)->set_enabled(false);
+              id(reconnect_later2).execute();
+            }
+            return;
+          }
+
+          // ── 상태 프레임 ──
+          if (b[1] != 0x00) return;
+          if (b == id(last_status2)) return;         // 중복 무시 (앱과 동일)
+          id(last_status2) = b;
+          id(session_ok2) = true;
+
+          int  g1   = b[3] & 0x01;
+          bool pw   = (b[3] & 0x02) != 0;
+          bool lk   = (b[3] & 0x04) != 0;
+          int  vol  = (b[4] >> 4) & 0x0F; if (vol > 3) vol = 3;
+          int  cur  = (g1 == 1) ? b[6] : b[7];
+          int  code = b[2];
+
+          // 설정온도는 난방 계열 모드에서만 프레임에 실린다 (OFF·오류·살균은 0xFE → 마지막 값 유지)
+          bool temp_valid = (code == 1 || code == 2 || code == 3 ||
+                             code == 7 || code == 8 || code == 9);
+          if (temp_valid) {
+            int st = (g1 == 1) ? b[9] : b[10];
+            if (st >= 28 && st <= 45) id(tx_temp2) = st;
+          }
+
+          ESP_LOGI("navien2", "상태 mode=%d power=%d lock=%d %s 현재=%d°C 설정=%d°C 음량=%d b12=%d",
+                   code, pw ? 1 : 0, lk ? 1 : 0, g1 ? "싱글" : "더블", cur, id(tx_temp2), vol, b[12]);
+          {
+            std::string rh; char rt[4];
+            for (uint8_t c : b) { sprintf(rt, "%02X ", c); rh += rt; }
+            ESP_LOGD("navien2", "RX %s", rh.c_str());
+          }
+
+          // 송신용 기준값 동기화
+          id(tx_mode2) = pw ? (code == 3 ? 3 : 1) : 6;           // 기본 운전모드는 난방/수면 둘뿐
+          id(tx_lock2) = lk;
+          id(tx_vol2)  = vol;
+          id(st_hour2) = (b[16] >> 4) & 0x0F;
+          // 빠른난방: b[15] = 남은 시간(분), 0/FE = 꺼짐
+          bool fo = pw && b[15] != 0xFE && b[15] > 0;
+          id(fast_on2) = fo;
+          if (fo)                          id(mat_mode_sel2).publish_state("빠른난방");
+          else if (code == 1 || code == 3) id(mat_mode_sel2).publish_state(code == 3 ? "수면" : "난방");
+          if (id(mat_auth2).state != "정상") id(mat_auth2).publish_state("정상");
+
+          id(mat_climate2).publish_from_device(pw, (float) cur, (float) id(tx_temp2));
+          id(mat_lock_sw2).publish_state(lk);
+
+          const char *vol_opts[4] = {"음소거", "1단", "2단", "3단"};
+          id(mat_vol2).publish_state(vol_opts[vol]);
+
+          const char *state_txt;
+          switch (code) {
+            case 1: state_txt = "난방";       break;
+            case 2: state_txt = "예약";       break;
+            case 3: state_txt = "수면";       break;
+            case 4: state_txt = "살균";       break;
+            case 5: state_txt = "오류";       break;
+            case 6: state_txt = "전원 꺼짐";  break;
+            case 7: state_txt = "빠른난방";   break;
+            case 8: state_txt = "이온케어";   break;
+            case 9: state_txt = "사용자 수면"; break;
+            default: state_txt = "알 수 없음"; break;
+          }
+          int err = (code == 5) ? (b[9] * 100 + b[10]) : 0;
+          id(err_code2) = err;
+          std::string st_txt = state_txt;
+          if (err > 0) { char eb[16]; sprintf(eb, " E%d", err); st_txt += eb; }
+          if (fo)      { char fb[24]; sprintf(fb, " · 빠른난방 %d분", b[15]); st_txt += fb; }
+          if (id(mat_state2).state != st_txt) id(mat_state2).publish_state(st_txt);
+      - if:
+          condition:
+            lambda: 'return id(need_auth2);'
+          then:
+            - lambda: 'id(need_auth2) = false;'
+            - delay: 300ms
+            - logger.log: { format: ">>> 매트2: deviceID 로 인증 전송", level: INFO }
+            - script.execute: send_register2
+
+########################################
+#  텍스트 센서 / 알림 수신 (두 캐릭터리스틱 모두 — 앱과 동일)
+########################################
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+    ssid:
+      name: "SSID"
+      entity_category: diagnostic
+    bssid:
+      name: "BSSID"
+      entity_category: diagnostic
+  # ── 매트1 ──
+  - platform: ble_client
+    ble_client_id: mat_ble
+    id: rx_01
+    internal: true
+    service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+    characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80100dd'
+    notify: true
+    update_interval: never
+    on_notify:
+      then:
+        - lambda: 'id(rx_buf).assign(x.begin(), x.end());'
+        - script.execute: parse_rx
+
+  - platform: ble_client
+    ble_client_id: mat_ble
+    id: rx_02
+    internal: true
+    service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+    characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80200dd'
+    notify: true
+    update_interval: never
+    on_notify:
+      then:
+        - lambda: 'id(rx_buf).assign(x.begin(), x.end());'
+        - script.execute: parse_rx
+
+  - platform: template
+    name: "Mat State"
+    id: mat_state
+    icon: mdi:radiator
+    update_interval: never
+
+  - platform: template
+    name: "Mat Connection"
+    id: mat_auth
+    icon: mdi:bluetooth-connect
+    entity_category: diagnostic
+    update_interval: never
+
+  # ── 매트2 ──
+  - platform: ble_client
+    ble_client_id: mat_ble2
+    id: rx_012
+    internal: true
+    service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+    characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80100dd'
+    notify: true
+    update_interval: never
+    on_notify:
+      then:
+        - lambda: 'id(rx_buf2).assign(x.begin(), x.end());'
+        - script.execute: parse_rx2
+
+  - platform: ble_client
+    ble_client_id: mat_ble2
+    id: rx_022
+    internal: true
+    service_uuid: '00001c0d-d102-11e1-9b23-2ce2a80000dd'
+    characteristic_uuid: '00001c0d-d102-11e1-9b23-2ce2a80200dd'
+    notify: true
+    update_interval: never
+    on_notify:
+      then:
+        - lambda: 'id(rx_buf2).assign(x.begin(), x.end());'
+        - script.execute: parse_rx2
+
+  - platform: template
+    name: "Mat2 State"
+    id: mat_state2
+    icon: mdi:radiator
+    update_interval: never
+
+  - platform: template
+    name: "Mat2 Connection"
+    id: mat_auth2
+    icon: mdi:bluetooth-connect
+    entity_category: diagnostic
+    update_interval: never
+
+########################################
+#  HA 엔티티
+########################################
+
+climate:
+  - platform: navien_mat
+    name: "Mat"
+    id: mat_climate
+    icon: mdi:radiator
+    visual:
+      min_temperature: 28
+      max_temperature: 45
+      temperature_step: 1
+
+  - platform: navien_mat
+    name: "Mat2"
+    id: mat_climate2
+    icon: mdi:radiator
+    visual:
+      min_temperature: 28
+      max_temperature: 45
+      temperature_step: 1
+
+########################################
+#  HA -> 매트 제어 요청 수거
+########################################
+
+interval:
+  - interval: 5s                  # 매트1 응답 감시
+    then:
+      - lambda: |-
+          if (id(mat_ble)->connected() && id(last_rx_ms) != 0 &&
+              millis() - id(last_rx_ms) > 10000 && id(mat_auth).state == "정상")
+            id(mat_auth).publish_state("응답 없음");
+
+  - interval: 200ms               # 매트1
+    then:
+      - if:
+          condition:
+            lambda: 'return id(mat_climate).take_pending();'
+          then:
+            - lambda: |-
+                // 끌 때만 6, 켤 때만 난방(1), 이미 켜져 있으면 현재 모드(수면 등) 유지
+                if (!id(mat_climate).requested_power()) id(tx_mode) = 6;
+                else if (id(tx_mode) == 6)              id(tx_mode) = 1;
+                int t = id(mat_climate).requested_temp();
+                if (t >= 28 && t <= 45) id(tx_temp) = t;
+            - script.execute: send_cmd
+
+  - interval: 5s                  # 매트2 응답 감시
+    then:
+      - lambda: |-
+          if (id(mat_ble2)->connected() && id(last_rx_ms2) != 0 &&
+              millis() - id(last_rx_ms2) > 10000 && id(mat_auth2).state == "정상")
+            id(mat_auth2).publish_state("응답 없음");
+
+  - interval: 200ms               # 매트2
+    then:
+      - if:
+          condition:
+            lambda: 'return id(mat_climate2).take_pending();'
+          then:
+            - lambda: |-
+                // 끌 때만 6, 켤 때만 난방(1), 이미 켜져 있으면 현재 모드(수면 등) 유지
+                if (!id(mat_climate2).requested_power()) id(tx_mode2) = 6;
+                else if (id(tx_mode2) == 6)              id(tx_mode2) = 1;
+                int t = id(mat_climate2).requested_temp();
+                if (t >= 28 && t <= 45) id(tx_temp2) = t;
+            - script.execute: send_cmd2
+
+switch:
+  # ── 매트1 ──
+  - platform: template
+    name: "Mat Child Lock"
+    id: mat_lock_sw
+    icon: mdi:lock
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: 'id(tx_lock) = true;'
+      - script.execute: send_cmd
+    turn_off_action:
+      - lambda: 'id(tx_lock) = false;'
+      - script.execute: send_cmd
+
+  - platform: template
+    name: "Mat BLE Enable"
+    id: ble_enable
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(mat_ble)->set_enabled(true);'
+    turn_off_action:
+      - script.stop: reconnect_later
+      - lambda: 'id(mat_ble)->set_enabled(false);'
+
+  # ── 매트2 ──
+  - platform: template
+    name: "Mat2 Child Lock"
+    id: mat_lock_sw2
+    icon: mdi:lock
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: 'id(tx_lock2) = true;'
+      - script.execute: send_cmd2
+    turn_off_action:
+      - lambda: 'id(tx_lock2) = false;'
+      - script.execute: send_cmd2
+
+  - platform: template
+    name: "Mat2 BLE Enable"
+    id: ble_enable2
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(mat_ble2)->set_enabled(true);'
+    turn_off_action:
+      - script.stop: reconnect_later2
+      - lambda: 'id(mat_ble2)->set_enabled(false);'
+
+select:
+  # ── 매트1 ──
+  - platform: template
+    name: "Mat Mode"
+    id: mat_mode_sel
+    icon: mdi:tune
+    optimistic: false             # 표시는 매트가 보고한 실제 상태로만 갱신
+    options:
+      - "난방"
+      - "수면"
+      - "빠른난방"
+    set_action:
+      - if:
+          condition:
+            lambda: 'return x == "빠른난방";'
+          then:
+            # 빠른난방 = 현재 모드(난방/수면) 위에 30분 부가기능. 꺼진 상태에선 무시
+            - if:
+                condition:
+                  lambda: 'return id(tx_mode) != 6;'
+                then:
+                  - lambda: |-
+                      id(once_mode) = 7;
+                      id(fast_req) = true;
+                  - script.execute: send_cmd
+                else:
+                  - logger.log: { format: "매트1: 전원 꺼짐 상태 - 빠른난방 무시", level: WARN }
+          else:
+            # 난방/수면 선택 → 해당 모드로, 빠른난방 중이었으면 함께 끔
+            - lambda: 'id(tx_mode) = (x == "수면") ? 3 : 1;'
+            - script.execute: send_cmd
+            - if:
+                condition:
+                  lambda: 'return id(fast_on);'
+                then:
+                  - delay: 400ms
+                  - lambda: |-
+                      id(once_mode) = 7;
+                      id(fast_req) = false;
+                  - script.execute: send_cmd
+
+  - platform: template
+    name: "Mat Volume"
+    id: mat_vol
+    icon: mdi:volume-high
+    entity_category: config
+    optimistic: true
+    options:
+      - "음소거"
+      - "1단"
+      - "2단"
+      - "3단"
+    set_action:
+      - lambda: |-
+          if (x == "음소거")      id(tx_vol) = 0;
+          else if (x == "1단")    id(tx_vol) = 1;
+          else if (x == "2단")    id(tx_vol) = 2;
+          else                    id(tx_vol) = 3;
+      - script.execute: send_cmd
+
+  # ── 매트2 ──
+  - platform: template
+    name: "Mat2 Mode"
+    id: mat_mode_sel2
+    icon: mdi:tune
+    optimistic: false             # 표시는 매트가 보고한 실제 상태로만 갱신
+    options:
+      - "난방"
+      - "수면"
+      - "빠른난방"
+    set_action:
+      - if:
+          condition:
+            lambda: 'return x == "빠른난방";'
+          then:
+            # 빠른난방 = 현재 모드(난방/수면) 위에 30분 부가기능. 꺼진 상태에선 무시
+            - if:
+                condition:
+                  lambda: 'return id(tx_mode2) != 6;'
+                then:
+                  - lambda: |-
+                      id(once_mode2) = 7;
+                      id(fast_req2) = true;
+                  - script.execute: send_cmd2
+                else:
+                  - logger.log: { format: "매트2: 전원 꺼짐 상태 - 빠른난방 무시", level: WARN }
+          else:
+            # 난방/수면 선택 → 해당 모드로, 빠른난방 중이었으면 함께 끔
+            - lambda: 'id(tx_mode2) = (x == "수면") ? 3 : 1;'
+            - script.execute: send_cmd2
+            - if:
+                condition:
+                  lambda: 'return id(fast_on2);'
+                then:
+                  - delay: 400ms
+                  - lambda: |-
+                      id(once_mode2) = 7;
+                      id(fast_req2) = false;
+                  - script.execute: send_cmd2
+
+  - platform: template
+    name: "Mat2 Volume"
+    id: mat_vol2
+    icon: mdi:volume-high
+    entity_category: config
+    optimistic: true
+    options:
+      - "음소거"
+      - "1단"
+      - "2단"
+      - "3단"
+    set_action:
+      - lambda: |-
+          if (x == "음소거")      id(tx_vol2) = 0;
+          else if (x == "1단")    id(tx_vol2) = 1;
+          else if (x == "2단")    id(tx_vol2) = 2;
+          else                    id(tx_vol2) = 3;
+      - script.execute: send_cmd2
+
+number:
+  - platform: template
+    name: "Mat Sleep Hours"
+    id: mat_sleep_h
+    icon: mdi:sleep
+    unit_of_measurement: "h"
+    min_value: 5
+    max_value: 12
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 8
+
+  - platform: template
+    name: "Mat2 Sleep Hours"
+    id: mat_sleep_h2
+    icon: mdi:sleep
+    unit_of_measurement: "h"
+    min_value: 5
+    max_value: 12
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 8
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_rssi
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: copy
+    source_id: wifi_rssi
+    name: "WiFi Signal Percent"
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "Signal %"
+    accuracy_decimals: 0
+    device_class: ""
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+
+binary_sensor:
+  - platform: template
+    name: "Mat Fault"
+    id: mat_fault
+    device_class: problem
+    lambda: 'return id(err_code) > 0;'
+
+  - platform: template
+    name: "Mat2 Fault"
+    id: mat_fault2
+    device_class: problem
+    lambda: 'return id(err_code2) > 0;'
+
+button:
+  # ── 매트1 ──
+  - platform: template
+    name: "Mat Ion Care"
+    icon: mdi:shimmer
+    on_press:
+      - lambda: 'id(once_mode) = 8;'
+      - script.execute: send_cmd
+
+  # 매트를 등록 모드로 둔 뒤 누름 (평소엔 HA 에서 비활성)
+  - platform: template
+    name: "Mat Re-register"
+    icon: mdi:link-variant
+    entity_category: config
+    disabled_by_default: true
+    on_press:
+      - script.stop: reconnect_later
+      - lambda: |-
+          id(have_id) = false;
+          id(mat_auth).publish_state("재등록 중");
+          ESP_LOGI("navien", "deviceID 삭제 → 재등록 요청");
+      - if:
+          condition:
+            lambda: 'return id(mat_ble)->connected();'
+          then:
+            - script.execute: send_register
+          else:
+            - lambda: 'id(mat_ble)->set_enabled(true);'   # 연결되면 on_connect 가 등록요청 전송
+
+  # ── 매트2 ──
+  - platform: template
+    name: "Mat2 Ion Care"
+    icon: mdi:shimmer
+    on_press:
+      - lambda: 'id(once_mode2) = 8;'
+      - script.execute: send_cmd2
+
+  # 매트를 등록 모드로 둔 뒤 누름 (평소엔 HA 에서 비활성)
+  - platform: template
+    name: "Mat2 Re-register"
+    icon: mdi:link-variant
+    entity_category: config
+    disabled_by_default: true
+    on_press:
+      - script.stop: reconnect_later2
+      - lambda: |-
+          id(have_id2) = false;
+          id(mat_auth2).publish_state("재등록 중");
+          ESP_LOGI("navien2", "deviceID 삭제 → 재등록 요청");
+      - if:
+          condition:
+            lambda: 'return id(mat_ble2)->connected();'
+          then:
+            - script.execute: send_register2
+          else:
+            - lambda: 'id(mat_ble2)->set_enabled(true);'   # 연결되면 on_connect 가 등록요청 전송
