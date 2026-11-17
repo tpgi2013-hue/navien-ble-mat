@@ -1,7 +1,7 @@
 # Navien BLE 온수매트 → Home Assistant (ESPHome)
 
 나비엔 **블루투스(BLE) 온수매트**(EQM-560 계열, 광고명 `kdo hotwatermat`)를 ESP32 하나로 Home Assistant에 연결하는 ESPHome 설정입니다.
-클라우드·앱 없이 로컬 BLE로 제어하며, 브릿지 1대로 **매트 1~2대**를 붙이고 **BLE 프록시** 역할도 겸합니다.
+클라우드·앱 없이 로컬 BLE로 제어하며, 브릿지 1대로 **매트 1~2대**를 붙입니다 (매트 전용, BLE 프록시 기능 없음).
 
 > 나비엔 공식 제품/앱과 무관한 비공식 프로젝트입니다. 사용에 따른 책임은 사용자에게 있습니다.
 
@@ -47,8 +47,8 @@
 
 1. `components/navien_mat/`를 ESPHome 설정 폴더(`/config/esphome/components/navien_mat/`)에 복사
 2. 매트 수에 맞는 YAML을 ESPHome에 추가
-   - 매트 1대: `navien-mat-bridge-single.yaml` (프록시 연결 슬롯 3)
-   - 매트 2대: `navien-mat-bridge.yaml` (프록시 연결 슬롯 2)
+   - 매트 1대: `navien-mat-bridge-single.yaml`
+   - 매트 2대: `navien-mat-bridge.yaml`
 3. `secrets.yaml`에 `secrets.yaml.example`의 항목 추가
 4. YAML 맨 위 `substitutions`에 매트 MAC 입력
    - 매트 MAC은 nRF Connect 등으로 `kdo hotwatermat`를 스캔해서 확인 (휴대폰 나비엔 앱은 종료한 상태로)
@@ -87,7 +87,12 @@
 - [ ] 수면 중 잠금·음량 변경 시 수면 타이머 리셋 여부
 - [ ] 더블매트(좌/우 독립) 레이아웃 실기 검증
 
-## 연결 슬롯
+## 연결 슬롯 · 스캔
 
-`esp32_ble.max_connections: 4` = 매트 2 + `bluetooth_proxy.connection_slots: 2` (1대용은 매트 1 + 프록시 3).
-광고만 보내는 센서(재실센서 등)는 슬롯을 쓰지 않으므로 프록시 수신에는 영향이 없습니다.
+`esp32_ble.max_connections` = 매트 수 (2대용 2, 1대용 1). BLE 프록시는 넣지 않습니다.
+
+ESP32-C6는 BLE와 2.4GHz Wi-Fi가 안테나 하나를 시간 나눠 씁니다. 처음에는 프록시를 겸하려고
+active 스캔을 94%(320ms 중 300ms) 돌렸는데, 이 때문에 Wi-Fi 송신이 실패했습니다.
+그래서 프록시를 빼고 스캔을 passive · 약 10%(320ms 중 30ms)로 줄였습니다.
+스캔은 매트가 끊겼을 때 다시 찾는 용도로만 쓰이고, 연결된 뒤의 통신에는 영향이 없습니다.
+BLE 프록시가 필요하면 별도 ESP32로 따로 두는 것을 권장합니다.
